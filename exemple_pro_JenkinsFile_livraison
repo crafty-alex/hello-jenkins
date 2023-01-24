@@ -1,0 +1,143 @@
+#!groovy
+def VERSION
+
+pipeline {
+    agent { label 'docker' }
+    environment {
+        GROUP_NAME = "backend-ea"
+        PROJECT_NAME = "dsn"
+
+        IMAGE_REGISTRY = "harbor.mutual31.k8s.recouv"
+        IMAGE_PUSH_NAME = "${IMAGE_REGISTRY}/ods/${GROUP_NAME}/${PROJECT_NAME}"
+
+        ARTIFACT_TYPE = "jar"
+        IMAGE_BUILD_ARGS = "--build-arg JAR_FILE=${PROJECT_NAME}-api-impl/target/${PROJECT_NAME}.${ARTIFACT_TYPE} "
+
+        DEPLOYMENT_SERVER = "moteurCalcul-demo.fabrique-dig.dcpro31.opk.recouv"
+        DEPLOYMENT_SERVER_USER = "centos"
+        DEPLOYMENT_DOCKER_HOST_PORT = "60020"
+        // URL du config server sur la VM
+        SPRING_CLOUD_CONFIG_URI = "http://172.17.0.1:49091"
+    }
+
+    stages {
+        stage('agent') {
+            agent {
+                docker {
+                    image 'fr/acoss/ods/moteur-calcul-paie/agent:latest'
+                    alwaysPull true
+                    // On expose le démon docker pour testcontainers
+                    args '-v /var/run/docker.sock:/var/run/docker.sock -u jenkins:docker'
+                }
+            }
+            stages {
+                stage('version') {
+                    steps {
+                        script {
+                            pom = readMavenPom file: "pom.xml"
+                            VERSION_SNAP = "${pom.properties['revision']}"
+                            VERSION = VERSION_SNAP.replaceAll("-SNAPSHOT", "")
+                            echo "*** version ${VERSION}"
+                            configFileProvider([configFile(fileId: 'Global_Maven_Settings', variable: 'MAVEN_SETTINGS_XML')]) {
+                                sh "mvn --no-transfer-progress -s $MAVEN_SETTINGS_XML versions:set -DgenerateBackupPoms=false -DnewVersion=$VERSION"
+                            }
+                            stash includes: 'pom.xml, **/pom.xml', name: 'poms'
+                        }
+                    }
+                }
+                stage('package') {
+                    steps {
+                        configFileProvider([configFile(fileId: 'Global_Maven_Settings', variable: 'MAVEN_SETTINGS_XML')]) {
+                            sh "mvn --no-transfer-progress -s $MAVEN_SETTINGS_XML clean package -DskipTests=true"
+                        }
+                        stash includes: "**/target/*.${ARTIFACT_TYPE}", name: 'targetfolder'
+                    }
+                }
+            }
+        }
+        stage('git-update-pom-version') {
+            steps {
+                unstash 'poms' // permet de récupérer les changements de version sur le pom.xml
+                catchError(buildResult: 'success', stageResult: 'unstable') {
+                    //Si la version est déjà a jour alors on ignore l'erreur
+                    sshagent(['SSH_KEY_GITLAB']) {
+                        sh "git ls-files . | grep pom.xml | xargs git add"
+                        sh "git commit -m \"Mise a jour des versions \""
+                        script {
+                            env.IS_COMMIT_TO_ADJUST_POM_VERSION = 'true'
+                        }
+                        sh "git push origin HEAD:${GIT_BRANCH.replaceAll('origin/', '')}"
+                    }
+                }
+            }
+        }
+        stage('git-tag') {
+            when { not { environment name: 'IS_COMMIT_TO_ADJUST_POM_VERSION', value: 'true' } }
+            steps {
+                sshagent(['SSH_KEY_GITLAB']) {
+                    sh "git tag ${VERSION} -m \"release v${VERSION} tag\""
+                    sh "git push origin HEAD:${GIT_BRANCH.replaceAll('origin/', '')} ${VERSION}"
+                }
+            }
+        }
+        stage('docker-image') {
+            when { not { environment name: 'IS_COMMIT_TO_ADJUST_POM_VERSION', value: 'true' } }
+            steps {
+                script {
+                    unstash 'targetfolder'
+                    customImage = docker.build("${IMAGE_PUSH_NAME}:${VERSION}", "${IMAGE_BUILD_ARGS}.")
+                    docker.withRegistry("http://${HARBOR_REGISTRY}", 'HARBOR_ODS_ID') {
+                        customImage.push("${VERSION}")
+                    }
+                }
+            }
+        }
+        stage('deploy') {
+            when { not { environment name: 'IS_COMMIT_TO_ADJUST_POM_VERSION', value: 'true' } }
+            steps {
+                script {
+                    CONFIG_SERVER_CONF = "-e SPRING_CLOUD_CONFIG_URI=${SPRING_CLOUD_CONFIG_URI}"
+                    DOCKER_CONTAINER_NAME = "${PROJECT_NAME}-valid"
+                    DOCKER_RUN_PARAMS = "${CONFIG_SERVER_CONF} -e SPRING_PROFILES_ACTIVE=valid-vm"
+
+                    sshagent(['SSH_KEY_MOTEUR_CALCUL_FABRIQUE_DIG']) {
+                        sh "ssh -o StrictHostKeyChecking=no ${DEPLOYMENT_SERVER_USER}@${DEPLOYMENT_SERVER} " +
+                                "docker stop ${DOCKER_CONTAINER_NAME} || true"
+                        sh "ssh -o StrictHostKeyChecking=no ${DEPLOYMENT_SERVER_USER}@${DEPLOYMENT_SERVER} " +
+                                "docker rm ${DOCKER_CONTAINER_NAME} || true"
+                        // le tag "--pull always" n'existe pas pour le docker run avec la version de docker installé sur la VM
+                        sh "ssh -o StrictHostKeyChecking=no ${DEPLOYMENT_SERVER_USER}@${DEPLOYMENT_SERVER} " +
+                                "docker rmi ${IMAGE_PUSH_NAME}:${VERSION} || true"
+                        sh "ssh -o StrictHostKeyChecking=no ${DEPLOYMENT_SERVER_USER}@${DEPLOYMENT_SERVER} " +
+                                "docker run " +
+                                "-d --name ${DOCKER_CONTAINER_NAME} ${DOCKER_RUN_PARAMS} " +
+                                "-p ${DEPLOYMENT_DOCKER_HOST_PORT}:8080 " +
+                                "--dns-search dcpro31.opk.recouv " +
+                                "--dns 10.207.34.128 " +
+                                "--dns 10.207.34.155 " +
+                                "--dns 10.203.36.132 " +
+                                "--dns 10.207.31.83 " +
+                                "${IMAGE_PUSH_NAME}:${VERSION}"
+                    }
+                }
+            }
+        }
+    }
+    options {
+        gitLabConnection('gitlab')
+    }
+    post {
+        success {
+            updateGitlabCommitStatus state: 'success'
+        }
+        unstable {
+            updateGitlabCommitStatus state: 'success'
+        }
+        failure {
+            updateGitlabCommitStatus state: 'failed'
+        }
+        cleanup {
+            deleteDir()
+        }
+    }
+}
